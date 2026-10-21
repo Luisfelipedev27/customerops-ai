@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CustomerOps ECS Fargate services; requires existing private networking, HTTPS ALB, PostgreSQL/pgvector and Redis.
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Immutable ECR image URI with digest
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+  TargetGroupArn:
+    Type: String
+    Description: Existing ALB IP target group on port 8000, health path /health/ready
+  PublicOrigin:
+    Type: String
+    AllowedPattern: 'https://.+'
+    Description: HTTPS origin, without trailing slash
+  RuntimeSecretArn:
+    Type: String
+    Description: Secrets Manager JSON with DATABASE_URL, REDIS_URL, OPENAI_API_KEY
+  Model:
+    Type: String
+    Description: Model available to the supplied account with Responses and function calling
+  OtlpEndpoint:
+    Type: String
+    Default: ''
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadRuntimeSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref RuntimeSecretArn
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CustomerOps ingress only from HTTPS ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+  Task:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: ARM64
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ImageUri
+          Essential: true
+          User: app
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - {Name: AI_MODE, Value: openai}
+            - {Name: OPENAI_MODEL, Value: !Ref Model}
+            - {Name: COOKIE_SECURE, Value: 'true'}
+            - {Name: ALLOWED_ORIGIN, Value: !Ref PublicOrigin}
+            - {Name: OTEL_ENDPOINT, Value: !Ref OtlpEndpoint}
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Sub '${RuntimeSecretArn}:DATABASE_URL::'
+            - Name: REDIS_URL
+              ValueFrom: !Sub '${RuntimeSecretArn}:REDIS_URL::'
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub '${RuntimeSecretArn}:OPENAI_API_KEY::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+          HealthCheck:
+            Command: [CMD, /app/.venv/bin/python, '-c', "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+        - Name: worker
+          Image: !Ref ImageUri
+          Essential: true
+          User: app
+          Command: [uv, run, --no-sync, celery, '-A', 'customerops_ai.jobs:celery_app', worker, --loglevel=INFO, --concurrency=2]
+          Environment:
+            - {Name: AI_MODE, Value: openai}
+            - {Name: OPENAI_MODEL, Value: !Ref Model}
+            - {Name: OTEL_ENDPOINT, Value: !Ref OtlpEndpoint}
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Sub '${RuntimeSecretArn}:DATABASE_URL::'
+            - Name: REDIS_URL
+              ValueFrom: !Sub '${RuntimeSecretArn}:REDIS_URL::'
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub '${RuntimeSecretArn}:OPENAI_API_KEY::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref Task
+      LaunchType: FARGATE
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnets
+          SecurityGroups: [!Ref SecurityGroup]
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroupArn
+Outputs:
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TaskDefinition:
+    Value: !Ref Task

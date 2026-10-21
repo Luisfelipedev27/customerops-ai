@@ -1,0 +1,6 @@
+[
+ {"name":"account-risk","question":"Why is Acme Corp at risk?","tools":["get_customer","get_tickets","search_knowledge"],"contains":["Acme","40","3"],"sources":true},
+ {"name":"knowledge-sla","question":"What is the Enterprise support SLA for critical incidents?","tools":["search_knowledge"],"contains":["hour"],"sources":true},
+ {"name":"human-approval","question":"Propose a follow-up task for Acme Corp.","tools":["propose_follow_up"],"contains":["approval"],"sources":false},
+ {"name":"unknown-account","question":"What is the revenue of Unknown Company XYZ?","tools":["list_customers"],"contains":["could not"],"sources":false}
+]
